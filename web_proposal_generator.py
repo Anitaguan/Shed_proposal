@@ -6,21 +6,25 @@ st.set_page_config(page_title="Aussie Solar Quote Engine", page_icon="☀️", l
 st.title("☀️ Aussie Solar & Battery Quote Engine")
 st.markdown("Auto-generate system configurations and client pricing based on roof dimensions.")
 
-# ================= 1. 销售员输入区（只有长宽、相数和利润率） =================
+# ================= 1. 销售员输入区 =================
 st.sidebar.header("🏠 Project Dimensions")
 roof_l = st.sidebar.number_input("Roof Length (m)", min_value=1.0, value=9.0, step=0.5)
 roof_w = st.sidebar.number_input("Roof Width (m)", min_value=1.0, value=6.0, step=0.5)
 is_three_phase = st.sidebar.checkbox("Three-Phase Power?", value=False)
 
-st.sidebar.header("💰 Sales Settings")
-margin_percent = st.sidebar.slider("Target Profit Margin (%)", min_value=15, max_value=60, value=40, step=5)
+st.sidebar.header("🔋 Battery Storage")
+# 新增：电池数量选择器（最少3块，最多15块）
+battery_qty_manual = st.sidebar.slider("Number of 5.12kWh Modules", min_value=3, max_value=15, value=3, step=1)
+st.sidebar.caption(f"Total Battery Capacity: {battery_qty_manual * 5.12:.2f} kWh")
 
-# ================= 2. 彻底锁定的硬件参数（页面上完全看不到！） =================
-# 如果你想改底价，只能在这里改代码
+
+# ================= 2. 彻底锁定的硬件参数和利润率 =================
+TARGET_MARGIN = 0  #0.40 # 🔒 这里固定了 40% 的毛利率，页面上不显示
+
 PANEL_L, PANEL_W = 1.905, 1.134
 PANEL_WATT = 475
 PANEL_PRICE_PER_WATT = 0.24  
-INSTALL_BOS_PER_WATT = 0.30  
+INSTALL_BOS_PER_WATT = 0.18 #balance of system  
 
 INVERTERS_LIST = [
     (5.0, 10.0, 1025.0, "Solinteg 5kW Single-Phase", False),
@@ -39,8 +43,7 @@ ELEC_PRICE, FIT_PRICE, ANNUAL_HOURS = 0.35, 0.06, 1400
 
 # ================= 3. 核心计算逻辑 =================
 @st.cache_data
-def calculate_quote(roof_l, roof_w, is_three_phase, margin_percent):
-    # (这里的逻辑完全不变，直接复制之前的逻辑即可)
+def calculate_quote(roof_l, roof_w, is_three_phase, battery_qty):
     count_a = int(roof_l // PANEL_L) * int(roof_w // PANEL_W)
     count_b = int(roof_l // PANEL_W) * int(roof_w // PANEL_L)
     max_panels = max(count_a, count_b)
@@ -54,7 +57,7 @@ def calculate_quote(roof_l, roof_w, is_three_phase, margin_percent):
         cap, max_pv, cost, desc, is_3p = inv
         if is_three_phase != is_3p: continue
         if total_dc_kw > max_pv: continue
-        if total_dc_kw / cap > 1.33 and cap != 5.0: continue
+        if total_dc_kw / cap > 1.5 and cap != 5.0: continue
         selected_inv = inv
         break
         
@@ -62,11 +65,11 @@ def calculate_quote(roof_l, roof_w, is_three_phase, margin_percent):
         max_available_inv = max([inv for inv in INVERTERS_LIST if inv[4] == is_three_phase], key=lambda x: x[0])
         cap, max_pv, cost, desc, is_3p = max_available_inv
         num_inverters = math.ceil(total_dc_kw / max_pv)
-        if (total_dc_kw / (cap * num_inverters)) > 1.33: num_inverters += 1
+        if (total_dc_kw / (cap * num_inverters)) > 1.5: num_inverters += 1
         selected_inv = max_available_inv
         desc = f"{num_inverters} x {desc} (Parallel)"
 
-    battery_qty = max(3, round(total_dc_kw / BATTERY_KWH_PER_UNIT))
+    # 电池直接使用前端传过来的数量
     sbdu_qty = math.ceil(battery_qty / BATTERY_PER_SBDU)
     total_battery_kwh = battery_qty * BATTERY_KWH_PER_UNIT
 
@@ -76,16 +79,30 @@ def calculate_quote(roof_l, roof_w, is_three_phase, margin_percent):
                      (battery_qty * BATTERY_UNIT_COST) + \
                      (sbdu_qty * SBDU_UNIT_COST)
                      
-    selling_price = total_raw_cost / (1 - margin_percent / 100)
+    selling_price = total_raw_cost / (1 - TARGET_MARGIN)
 
-    stc_rebate = total_dc_kw * 1.5 * STC_PRICE * STC_YEARS
+    # 计算阶梯补贴
+    # 根据客户所在城市选择 Zone Rating
+    # Sydney/Melbourne/Adelaide/Canberra = 1.382
+    # Brisbane/Perth = 1.536
+    # Darwin = 1.622
+    # Hobart = 1.185
+    ZONE_RATING = 1.382  # 以悉尼为例
+
+    stc_rebate = total_dc_kw * ZONE_RATING * STC_PRICE * STC_YEARS
     base_rate = STC_PRICE * 14 * 0.52
     b_rebate = 0; rem = total_battery_kwh
-    t1 = min(rem, 14.0); b_rebate += t1 * base_rate; rem -= t1
-    if rem > 0: t2 = min(rem, 14.0); b_rebate += t2 * base_rate * 0.60; rem -= t2
-    if rem > 0: t3 = min(rem, 22.0); b_rebate += t3 * base_rate * 0.15
-    total_rebate = stc_rebate + b_rebate
     
+    # 第一阶梯 0-14
+    t1 = min(rem, 14.0); b_rebate += t1 * base_rate; rem -= t1
+    # 第二阶梯 14-28
+    if rem > 0: t2 = min(rem, 14.0); b_rebate += t2 * base_rate * 0.60; rem -= t2
+    # 第三阶梯 28-50
+    if rem > 0: t3 = min(rem, 22.0); b_rebate += t3 * base_rate * 0.15; rem -= t3
+    # 第四阶梯 >50 (无补贴，代码只是占位防止报错)
+    if rem > 0: t4 = min(rem, 22.0); b_rebate += t4 * base_rate * 0.0; rem -= t4
+    
+    total_rebate = stc_rebate + b_rebate
     client_out_of_pocket = selling_price - total_rebate
     year1_savings = (total_dc_kw * ANNUAL_HOURS * 0.85 * ELEC_PRICE) + (total_dc_kw * ANNUAL_HOURS * 0.15 * FIT_PRICE)
     payback = client_out_of_pocket / year1_savings if year1_savings > 0 else 0
@@ -97,7 +114,8 @@ def calculate_quote(roof_l, roof_w, is_three_phase, margin_percent):
         "client_out_of_pocket": client_out_of_pocket, "year1_savings": year1_savings, "payback": payback
     }
 
-result = calculate_quote(roof_l, roof_w, is_three_phase, margin_percent)
+# 传入电池数量
+result = calculate_quote(roof_l, roof_w, is_three_phase, battery_qty_manual)
 
 # ================= 4. 页面展示 =================
 if result is None:
@@ -116,7 +134,6 @@ else:
     
     with st.expander("View Detailed Pricing & Rebates"):
         st.write(f"**Gross Selling Price:** ${result['selling_price']:,.2f}")
-        st.write(f"*Includes {margin_percent}% sales margin*")
         st.write("---")
         st.write(f"**Federal STC Rebate:** -${result['stc_rebate']:,.2f}")
         st.write(f"**Federal Battery Rebate:** -${result['battery_rebate']:,.2f}")
